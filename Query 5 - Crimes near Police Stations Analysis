@@ -1,0 +1,300 @@
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "2",
+        "spark.executor.memory": "8g",
+        "spark.executor.cores": "4",
+        "spark.driver.memory": "1g"
+    }
+}
+
+---------------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+---------------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, desc
+from sedona.spark import *
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+import time
+
+# Begin counting execution time
+start_time = time.time()
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("Query 5 - Crimes near Police Stations Analysis") \
+    .getOrCreate()
+
+# Register Sedona functions
+SedonaRegistrator.registerAll(spark)
+
+# Load crime data from S3
+crime_data_path1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2010_to_2019 = spark.read.csv(crime_data_path1, header=True, inferSchema=True)
+
+crime_data_path2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+crime_data_2020_to_present = spark.read.csv(crime_data_path2, header=True, inferSchema=True)
+
+# Combine datasets
+crime_data = crime_data_2010_to_2019.union(crime_data_2020_to_present)
+
+# Filter data for valid coordinates
+filtered_crimes = crime_data.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    ((col("LAT") != 0) & (col("LON") != 0))
+)
+
+# Create crime point geometry
+filtered_crimes_with_geometry = filtered_crimes.withColumn(
+    "crime_location", ST_Point(col("LON"), col("LAT"))
+)
+
+# Load division data
+division_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+divisions = spark.read.csv(division_data_path, header=True, inferSchema=True)
+
+# Create division point geometry
+divisions_with_geometry = divisions.withColumn(
+    "geometry_column", ST_Point(col("X"), col("Y"))
+).select(
+    col("DIVISION").alias("division"),
+    col("geometry_column")
+)
+
+# Perform spatial join: calculate distance from each crime to each division
+distance_data = filtered_crimes_with_geometry.crossJoin(divisions_with_geometry) \
+    .withColumn("distance", ST_DistanceSphere(col("crime_location"), col("geometry_column"))/1000)
+window_spec = Window.partitionBy("DR_NO").orderBy(col("distance"))
+closest_station = distance_data.withColumn("rank", row_number().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Group by division and compute the number of crimes and average distance
+result = closest_station.groupBy("DIVISION").agg(
+    count("DR_NO").alias("#"),
+    avg("distance").alias("average_distance")
+).orderBy("#", ascending=False)
+
+# Show the results
+result.show(truncate=False)
+
+# Stop counting execution time
+end_time = time.time()
+
+# Calculation of total execution time
+execution_time = end_time - start_time
+print(f"Total Execution Time: {execution_time:.2f} seconds")
+
+# Stop SparkSession
+spark.stop()
+
+---------------------------------------------------------------------------------------------------
+
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "4",
+        "spark.executor.memory": "4g",
+        "spark.executor.cores": "2",
+        "spark.driver.memory": "1g"
+    }
+}
+
+---------------------------------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+----------------------------------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, desc
+from sedona.spark import *
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+import time
+
+# Begin counting execution time
+start_time = time.time()
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("Query 5 - Crimes near Police Stations Analysis") \
+    .getOrCreate()
+
+# Register Sedona functions
+SedonaRegistrator.registerAll(spark)
+
+# Load crime data
+crime_data_path1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2010_to_2019 = spark.read.csv(crime_data_path1, header=True, inferSchema=True)
+
+crime_data_path2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+crime_data_2020_to_present = spark.read.csv(crime_data_path2, header=True, inferSchema=True)
+
+# Combine datasets
+crime_data = crime_data_2010_to_2019.union(crime_data_2020_to_present)
+
+# Filter data for valid coordinates
+filtered_crimes = crime_data.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    ((col("LAT") != 0) & (col("LON") != 0))
+)
+
+# Create crime point geometry
+filtered_crimes_with_geometry = filtered_crimes.withColumn(
+    "crime_location", ST_Point(col("LON"), col("LAT"))
+)
+
+# Load division data
+division_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+divisions = spark.read.csv(division_data_path, header=True, inferSchema=True)
+
+# Create division point geometry
+divisions_with_geometry = divisions.withColumn(
+    "geometry_column", ST_Point(col("X"), col("Y"))
+).select(
+    col("DIVISION").alias("division"),
+    col("geometry_column")
+)
+
+# Perform spatial join: calculate distance from each crime to each division
+distance_data = filtered_crimes_with_geometry.crossJoin(divisions_with_geometry) \
+    .withColumn("distance", ST_DistanceSphere(col("crime_location"), col("geometry_column"))/1000)
+window_spec = Window.partitionBy("DR_NO").orderBy(col("distance"))
+closest_station = distance_data.withColumn("rank", row_number().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Group by division and compute the number of crimes and average distance
+result = closest_station.groupBy("DIVISION").agg(
+    count("DR_NO").alias("#"),
+    avg("distance").alias("average_distance")
+).orderBy("#", ascending=False)
+
+# Show the results
+result.show(truncate=False)
+
+# Stop counting execution time
+end_time = time.time()
+
+# Calculation of total execution time
+execution_time = end_time - start_time
+print(f"Total Execution Time: {execution_time:.2f} seconds")
+
+# Stop SparkSession
+spark.stop()
+
+-------------------------------------------------------------------------------------------------------
+
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "8",
+        "spark.executor.memory": "2g",
+        "spark.executor.cores": "1",
+        "spark.driver.memory": "1g"
+    }
+}
+
+------------------------------------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+------------------------------------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, avg, desc
+from sedona.spark import *
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+import time
+
+# Begin counting execution time
+start_time = time.time()
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("Query 5 - Crimes near Police Stations Analysis") \
+    .getOrCreate()
+
+# Register Sedona functions
+SedonaRegistrator.registerAll(spark)
+
+# Load crime data
+crime_data_path1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2010_to_2019 = spark.read.csv(crime_data_path1, header=True, inferSchema=True)
+
+crime_data_path2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+crime_data_2020_to_present = spark.read.csv(crime_data_path2, header=True, inferSchema=True)
+
+# Combine datasets
+crime_data = crime_data_2010_to_2019.union(crime_data_2020_to_present)
+
+# Filter data for valid coordinates
+filtered_crimes = crime_data.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    ((col("LAT") != 0) & (col("LON") != 0))
+)
+
+# Create crime point geometry
+filtered_crimes_with_geometry = filtered_crimes.withColumn(
+    "crime_location", ST_Point(col("LON"), col("LAT"))
+)
+
+# Load division data
+division_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_Police_Stations.csv"
+divisions = spark.read.csv(division_data_path, header=True, inferSchema=True)
+
+# Create division point geometry
+divisions_with_geometry = divisions.withColumn(
+    "geometry_column", ST_Point(col("X"), col("Y"))
+).select(
+    col("DIVISION").alias("division"),
+    col("geometry_column")
+)
+
+# Perform spatial join: calculate distance from each crime to each division
+distance_data = filtered_crimes_with_geometry.crossJoin(divisions_with_geometry) \
+    .withColumn("distance", ST_DistanceSphere(col("crime_location"), col("geometry_column"))/1000)
+window_spec = Window.partitionBy("DR_NO").orderBy(col("distance"))
+closest_station = distance_data.withColumn("rank", row_number().over(window_spec)) \
+    .filter(col("rank") == 1)
+
+# Group by division and compute the number of crimes and average distance
+result = closest_station.groupBy("DIVISION").agg(
+    count("DR_NO").alias("#"),
+    avg("distance").alias("average_distance")
+).orderBy("#", ascending=False)
+
+# Show the results
+result.show(truncate=False)
+
+# Stop counting execution time
+end_time = time.time()
+
+# Calculation of total execution time
+execution_time = end_time - start_time
+print(f"Total Execution Time: {execution_time:.2f} seconds")
+
+# Stop SparkSession
+spark.stop()
