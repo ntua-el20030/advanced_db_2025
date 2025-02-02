@@ -1,0 +1,148 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, when, desc, row_number
+from pyspark.sql.window import Window
+import time
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("Query 2 - Closed Cases Rate Precincts per Year") \
+    .config("spark.executor.memory", "4g") \
+    .config("spark.executor.cores", "2") \
+    .getOrCreate()
+
+# Begin time calculation for DataFrame API
+start_time_df = time.time()
+
+# Load datasets
+crime_data_path_1_df = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2010_to_2019_df = spark.read.csv(crime_data_path_1_df, header=True, inferSchema=True)
+
+crime_data_path_2_df = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+crime_data_2020_to_present_df = spark.read.csv(crime_data_path_2_df, header=True, inferSchema=True)
+
+# Combine the two datasets
+crime_data_df = crime_data_2010_to_2019_df.union(crime_data_2020_to_present_df)
+
+# Filter relevant columns from crime data and derive the "is_closed" column
+filtered_data_df = crime_data_df.select(
+    col("DATE OCC").alias("date"),
+    col("AREA NAME").alias("precinct"),
+    when(col("Status Desc").isin("UNK", "Invest Cont"), 0).otherwise(1).alias("is_closed")
+).filter(col("precinct").isNotNull())
+
+# Extract year from the date
+filtered_crime_data_df = filtered_data_df.withColumn("year", col("date").substr(7, 4).cast("int"))
+
+# DataFrame API implementation
+case_stats_df = filtered_crime_data_df.groupBy("year", "precinct").agg(
+    count(when(col("is_closed") == 1, 1)).alias("closed_cases"),
+    count("is_closed").alias("total_cases")
+).withColumn("closed_case_rate", (col("closed_cases") / col("total_cases")) * 100)
+
+window_spec = Window.partitionBy("year").orderBy(desc("closed_case_rate"))
+ranked_df = case_stats_df.withColumn("rank", row_number().over(window_spec))
+top_3_df = ranked_df.filter(col("rank") <= 3).select("year", "precinct", "closed_case_rate", "rank").orderBy("year", "rank")
+
+end_time_df = time.time()
+execution_time_df = end_time_df - start_time_df
+
+# Display the DataFrame API results
+print("Top 3 Precincts per Year by Closed Case Rate (DataFrame API):")
+top_3_df.show(n=1000, truncate=False) 
+
+print(f"DataFrame API execution time: {execution_time_df} seconds")
+print() 
+print("-" * 80)
+print() 
+
+# Begin time calculation for SQL
+start_time_sql = time.time()
+
+# Load datasets
+crime_data_path_1_sql = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_2010_to_2019_sql = spark.read.csv(crime_data_path_1_sql, header=True, inferSchema=True)
+
+crime_data_path_2_sql = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+crime_data_2020_to_present_sql = spark.read.csv(crime_data_path_2_sql, header=True, inferSchema=True)
+
+# Combine the two datasets
+crime_data_sql = crime_data_2010_to_2019_sql.union(crime_data_2020_to_present_sql)
+
+# Filter relevant columns from crime data and derive the "is_closed" column
+filtered_data_sql = crime_data_sql.select(
+    col("DATE OCC").alias("date"),
+    col("AREA NAME").alias("precinct"),
+    when(col("Status Desc").isin("UNK", "Invest Cont"), 0).otherwise(1).alias("is_closed")
+).filter(col("precinct").isNotNull())
+
+# Extract year from the date
+filtered_crime_data_sql = filtered_data_sql.withColumn("year", col("date").substr(7, 4).cast("int"))
+
+# SQL API implementation
+filtered_crime_data_sql.createOrReplaceTempView("crime_data")
+sql = spark.sql('''
+    SELECT year, precinct, closed_case_rate, rank
+    FROM (
+        SELECT 
+            year, 
+            precinct, 
+            (COUNT(CASE WHEN is_closed = 1 THEN 1 END) * 100.0 / COUNT(is_closed)) AS closed_case_rate,
+            ROW_NUMBER() OVER (PARTITION BY year ORDER BY (COUNT(CASE WHEN is_closed = 1 THEN 1 END) * 100.0 / COUNT(is_closed)) DESC) AS rank
+        FROM crime_data
+        GROUP BY year, precinct
+    ) ranked
+    WHERE rank <= 3
+    ORDER BY year, rank
+''')
+
+end_time_sql = time.time()
+execution_time_sql = end_time_sql - start_time_sql
+
+# Display the SQL API results
+print("Top 3 Precincts per Year by Closed Case Rate (SQL API):")
+sql.show(n=1000, truncate=False) 
+
+print(f"SQL API execution time: {execution_time_sql} seconds")
+print()
+
+----------------------------------------------------------------------------------------------------------------
+
+# Save the dataset in a parquet format in our group's S3 bucket
+output_path_parquet = "s3://groups-bucket-dblab-905418150721/group36//query_2_results.parquet"
+crime_data_df.write.mode("overwrite").parquet(output_path_parquet)
+
+# DataFrame API implementation with Parquet data
+start_time_parquet_query = time.time()
+
+# Load data from Parquet format
+crime_data_parquet = spark.read.parquet(output_path_parquet)
+
+filtered_parquet_data_df = crime_data_parquet.select(
+    col("DATE OCC").alias("date"),
+    col("AREA NAME").alias("precinct"),
+    when(col("Status Desc").isin("UNK", "Invest Cont"), 0).otherwise(1).alias("is_closed")
+).filter(col("precinct").isNotNull())
+
+filtered_parquet_data_df = filtered_parquet_data_df.withColumn("year", col("date").substr(7, 4).cast("int"))
+
+case_stats_parquet_df = filtered_parquet_data_df.groupBy("year", "precinct").agg(
+    count(when(col("is_closed") == 1, 1)).alias("closed_cases"),
+    count("is_closed").alias("total_cases")
+).withColumn("closed_case_rate", (col("closed_cases") / col("total_cases")) * 100)
+
+window_spec_parquet = Window.partitionBy("year").orderBy(desc("closed_case_rate"))
+ranked_parquet_df = case_stats_parquet_df.withColumn("rank", row_number().over(window_spec_parquet))
+top_3_parquet_df = ranked_parquet_df.filter(col("rank") <= 3).select("year", "precinct", "closed_case_rate", "rank").orderBy("year", "rank")
+
+end_time_parquet_query = time.time()
+parquet_query_execution_time = end_time_parquet_query - start_time_parquet_query
+
+# Display the Parquet results
+print("Top 3 Precincts per Year by Closed Case Rate (Parquet Data):")
+top_3_parquet_df.show(n=1000, truncate=False)
+
+# Print execution time
+print(f"Parquet Query Execution Time: {parquet_query_execution_time} seconds")
+
+# Stop SparkSession
+spark.stop()
