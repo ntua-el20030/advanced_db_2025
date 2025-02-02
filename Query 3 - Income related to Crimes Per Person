@@ -1,0 +1,139 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum, regexp_replace, lit
+from sedona.spark import *
+import time
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("Query 3 - Income related to Crimes Per Person") \
+    .getOrCreate()
+
+# Create Sedona context for geospatial data processing
+sedona = SedonaContext.create(spark)
+
+# Load datasets
+crime_data_path_1_df = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_path_2_df = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+
+income_path_df = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+geojson_path_df = "s3://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+
+crime_data_2010_to_2019_df = spark.read.csv(crime_data_path_1_df, header=True, inferSchema=True)
+crime_data_2020_to_present_df = spark.read.csv(crime_data_path_2_df, header=True, inferSchema=True)
+crime_data_df = crime_data_2010_to_2019_df.union(crime_data_2020_to_present_df)
+
+income_df = spark.read.csv(income_path_df, header=True, inferSchema=True)
+
+## Reload the GeoJSON and explode features if necessary
+blocks_df = sedona.read.format("geojson") \
+            .option("multiLine", "true").load(geojson_path_df)
+
+# Test if features need to be exploded
+# This assumes your GeoJSON has a nested structure (sometimes GeoJSON is deeply nested)
+blocks_df = blocks_df.selectExpr("explode(features) as feature")
+
+# Select properties and geometry fields from exploded features
+flattened_df = blocks_df.select(
+    col("feature.geometry").alias("geometry"),
+    col("feature.properties").alias("properties")
+)
+
+# Access properties fields
+flattened_df = flattened_df.select("geometry", "properties.*")
+
+# Filter for Los Angeles areas and aggregate geometries
+LA_blocks = flattened_df.filter(col("CITY") == "Los Angeles") \
+    .select("COMM", "HOUSING10", "POP_2010", "ZCTA10", "geometry")
+
+# Remove "$" and any non-numeric characters from the income column
+income_df = income_df.withColumn(
+    "Estimated Median Income",
+    regexp_replace(col("Estimated Median Income"), r"[^0-9.]", "").cast("double")
+)
+
+# Create geometries for crime locations
+crime_locations = crime_data_df.where(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull())
+).select(
+    ST_Point(col("LON"), col("LAT")).alias("geometry")
+)
+
+# Function to execute different join strategies
+def execute_join_strategy(strategy_hint, strategy_name):
+    print(f"{strategy_name} Join Strategy:\n")
+
+    # Record start time
+    start_time = time.time()
+
+    # Count crimes within blocks
+    crimes_within_blocks = crime_locations.join(
+        LA_blocks.hint(strategy_hint)
+    ).filter(
+        ST_Within(crime_locations["geometry"], LA_blocks["geometry"])
+    ).select(
+        LA_blocks["COMM"].alias("Community")
+    )
+
+    total_crimes = crimes_within_blocks.groupBy("Community").agg(
+        count("*").alias("Total Crimes")
+    )
+
+    # Calculate per capita income per area
+    income_with_housing = income_df.join(
+        LA_blocks.hint(strategy_hint),
+        income_df["Zip Code"] == LA_blocks["ZCTA10"],
+        "inner"
+    ).select(
+        LA_blocks["COMM"].alias("Community"),
+        (col("HOUSING10") * col("Estimated Median Income")).alias("Block Income"),
+        col("POP_2010").alias("Population")
+    )
+
+    income_summary = income_with_housing.groupBy("Community").agg(
+        sum("Block Income").alias("Total Income"),
+        sum("Population").alias("Total Population")
+    ).withColumn(
+        "Average Income Per Person",
+        col("Total Income") / col("Total Population")
+    )
+
+    # Calculate average crimes per person
+    # Join the crime and income data
+    joined_data = total_crimes.join(
+        income_summary,
+        "Community",
+        "inner"
+    )
+
+    # Compute Crime Ratio Per Person and reorder columns
+    final_result = joined_data.select(
+        joined_data["Community"].alias("Area"),
+        joined_data["Average Income Per Person"],
+        (joined_data["Total Crimes"] / joined_data["Total Population"]).alias("Crime Ratio Per Person")
+    ).orderBy(
+        col("Average Income Per Person").desc()
+    )
+
+    # Show results
+    final_result.show()
+
+    # Record end time
+    end_time = time.time()
+
+    # Calculate execution time
+    execution_time = end_time - start_time
+    print(f"Execution time for {strategy_name} join: {execution_time} seconds\n")
+
+    # Explain execution plan
+    final_result.explain(mode="formatted")
+
+# Execute join strategies
+strategies = [
+    ("BROADCAST", "Broadcast"),
+    ("MERGE", "Merge"),
+    ("SHUFFLE_HASH", "Shuffle Hash"),
+    ("SHUFFLE_REPLICATE_NL", "Shuffle Replicate NL")
+]
+
+for strategy_hint, strategy_name in strategies:
+    execute_join_strategy(strategy_hint, strategy_name)
