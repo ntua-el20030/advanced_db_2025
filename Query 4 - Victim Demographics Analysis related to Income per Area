@@ -1,0 +1,405 @@
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "2",
+        "spark.executor.memory": "2g",
+        "spark.executor.cores": "1",
+        "spark.driver.memory": "1g"
+    }
+}
+
+-------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+-------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum, regexp_replace, year, to_date, when
+from sedona.spark import *
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Query 4 - Victim Demographics Analysis related to Income per Area") \
+    .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+    .getOrCreate()
+
+# Sedona registration
+sedona = SedonaContext.create(spark)
+
+# Begin counting execution time
+start_time = time.time()
+
+# Load data
+crime_data_path_1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_path_2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+income_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+geojson_path = "s3://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+re_codes_path = "s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv"
+
+crime_df_2010_2019 = spark.read.csv(crime_data_path_1, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_path_2, header=True, inferSchema=True)
+crime_data_df = crime_df_2010_2019.union(crime_df_2020_present)
+
+income_df = spark.read.csv(income_data_path, header=True, inferSchema=True)
+re_codes_df = spark.read.csv(re_codes_path, header=True, inferSchema=True)
+
+# Load GeoJSON data
+geojson_df = sedona.read.format("geojson") \
+            .option("multiLine", "true").load(geojson_path) \
+            .selectExpr("explode(features) as feature")
+
+geojson_df = geojson_df.select(
+    col("feature.geometry").alias("geometry"),
+    col("feature.properties.*")
+)
+
+# Filter only Los Angeles areas
+la_blocks = geojson_df.filter(col("CITY") == "Los Angeles") \
+    .select("COMM", "ZCTA10", "POP_2010", "HOUSING10", "geometry")
+
+# Clean and calculate income
+income_df = income_df.withColumn(
+    "Estimated Median Income",
+    regexp_replace(col("Estimated Median Income"), r"[^0-9.]", "").cast("double")
+)
+
+# Filter crimes for 2015 κand create geometry
+crime_2015 = crime_data_df.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    (year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a")) == 2015)
+).withColumn("geometry", ST_Point(col("LON"), col("LAT")))
+
+# Calculate income per capita
+income_per_person = la_blocks.join(
+    income_df,
+    la_blocks["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).withColumn(
+    "Total Income",
+    (col("HOUSING10") * col("Estimated Median Income"))
+).groupBy("COMM").agg(
+    ST_Union_Aggr("geometry").alias("geometry"),
+    sum("Total Income").alias("Total_Income"),
+    sum("POP_2010").alias("Total_Population")
+).withColumn(
+    "Avg_Income_Per_Person",
+    (col("Total_Income") / col("Total_Population"))
+)
+
+# Choose top 3 and bottom 3 income areas
+top_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=False).limit(3)
+bottom_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=True).limit(3)
+
+# Function for spatial join and victim profile
+def get_victim_profile(areas):
+    join_result = crime_2015.join(
+        areas,
+        ST_Within(crime_2015["geometry"], areas["geometry"])
+    )
+    
+    profile = join_result.groupBy("Vict Descent").agg(
+        count("*").alias("Victim_Count")
+    ).join(
+        re_codes_df,
+        "Vict Descent",
+        "left"
+    ).withColumn(
+        "Victim Descent Full",
+        when(col("Vict Descent Full").isNull(), col("Vict Descent")).otherwise(col("Vict Descent Full"))
+    ).select(
+        col("Victim Descent Full").alias("Victim Descent"),
+        "Victim_Count"
+    ).orderBy("Victim_Count", ascending=False)
+
+    return profile
+
+# Print victims profile
+print("\n=== Victim Profile in High-Income Areas ===")
+get_victim_profile(top_3_income_areas).show(truncate=False)
+
+print("\n=== Victim Profile in Low-Income Areas ===")
+get_victim_profile(bottom_3_income_areas).show(truncate=False)
+
+# Calculate total execution time
+end_time = time.time()
+print(f"Execution Time: {end_time - start_time} seconds")
+
+--------------------------------------------------------------------------------------------------------------
+
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "2",
+        "spark.executor.memory": "4g",
+        "spark.executor.cores": "2",
+        "spark.driver.memory": "1g"
+    }
+}
+
+---------------------------------------------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+---------------------------------------------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum, regexp_replace, year, to_date, when
+from sedona.spark import *
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Query 4 - Victim Demographics Analysis related to Income per Area") \
+    .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+    .getOrCreate()
+
+# Sedona registration
+sedona = SedonaContext.create(spark)
+
+# Begin counting execution time
+start_time = time.time()
+
+# Load data
+crime_data_path_1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_path_2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+income_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+geojson_path = "s3://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+re_codes_path = "s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv"
+
+crime_df_2010_2019 = spark.read.csv(crime_data_path_1, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_path_2, header=True, inferSchema=True)
+crime_data_df = crime_df_2010_2019.union(crime_df_2020_present)
+
+income_df = spark.read.csv(income_data_path, header=True, inferSchema=True)
+re_codes_df = spark.read.csv(re_codes_path, header=True, inferSchema=True)
+
+# Load GeoJSON data
+geojson_df = sedona.read.format("geojson") \
+            .option("multiLine", "true").load(geojson_path) \
+            .selectExpr("explode(features) as feature")
+
+geojson_df = geojson_df.select(
+    col("feature.geometry").alias("geometry"),
+    col("feature.properties.*")
+)
+
+# Filter only Los Angeles areas
+la_blocks = geojson_df.filter(col("CITY") == "Los Angeles") \
+    .select("COMM", "ZCTA10", "POP_2010", "HOUSING10", "geometry")
+
+# Clean and calculate income
+income_df = income_df.withColumn(
+    "Estimated Median Income",
+    regexp_replace(col("Estimated Median Income"), r"[^0-9.]", "").cast("double")
+)
+
+# Filter crimes for 2015 κand create geometry
+crime_2015 = crime_data_df.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    (year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a")) == 2015)
+).withColumn("geometry", ST_Point(col("LON"), col("LAT")))
+
+# Calculate income per capita
+income_per_person = la_blocks.join(
+    income_df,
+    la_blocks["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).withColumn(
+    "Total Income",
+    (col("HOUSING10") * col("Estimated Median Income"))
+).groupBy("COMM").agg(
+    ST_Union_Aggr("geometry").alias("geometry"),
+    sum("Total Income").alias("Total_Income"),
+    sum("POP_2010").alias("Total_Population")
+).withColumn(
+    "Avg_Income_Per_Person",
+    (col("Total_Income") / col("Total_Population"))
+)
+
+# Choose top 3 and bottom 3 income areas
+top_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=False).limit(3)
+bottom_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=True).limit(3)
+
+# Function for spatial join and victim profile
+def get_victim_profile(areas):
+    join_result = crime_2015.join(
+        areas,
+        ST_Within(crime_2015["geometry"], areas["geometry"])
+    )
+    
+    profile = join_result.groupBy("Vict Descent").agg(
+        count("*").alias("Victim_Count")
+    ).join(
+        re_codes_df,
+        "Vict Descent",
+        "left"
+    ).withColumn(
+        "Victim Descent Full",
+        when(col("Vict Descent Full").isNull(), col("Vict Descent")).otherwise(col("Vict Descent Full"))
+    ).select(
+        col("Victim Descent Full").alias("Victim Descent"),
+        "Victim_Count"
+    ).orderBy("Victim_Count", ascending=False)
+
+    return profile
+
+# Print victims profile
+print("\n=== Victim Profile in High-Income Areas ===")
+get_victim_profile(top_3_income_areas).show(truncate=False)
+
+print("\n=== Victim Profile in Low-Income Areas ===")
+get_victim_profile(bottom_3_income_areas).show(truncate=False)
+
+# Calculate total execution time
+end_time = time.time()
+print(f"Execution Time: {end_time - start_time} seconds")
+
+-------------------------------------------------------------------------------------------------
+
+%%configure -f
+{
+    "conf": {
+        "spark.executor.instances": "2",
+        "spark.executor.memory": "8g",
+        "spark.executor.cores": "4",
+        "spark.driver.memory": "1g"
+    }
+}
+
+-------------------------------------------------------------------------------------------------
+
+# Access configuration
+conf = spark.sparkContext.getConf()
+
+# Print relevant executor settings
+print("Executor Instances:", conf.get("spark.executor.instances"))
+print("Executor Memory:", conf.get("spark.executor.memory"))
+print("Executor Cores:", conf.get("spark.executor.cores"))
+
+-------------------------------------------------------------------------------------------------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum, regexp_replace, year, to_date, when
+from sedona.spark import *
+import time
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Query 4 - Victim Demographics Analysis related to Income per Area") \
+    .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+    .getOrCreate()
+
+# Sedona registration
+sedona = SedonaContext.create(spark)
+
+# Begin counting execution time
+start_time = time.time()
+
+# Load data
+crime_data_path_1 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2010_to_2019_20241101.csv"
+crime_data_path_2 = "s3://initial-notebook-data-bucket-dblab-905418150721/CrimeData/Crime_Data_from_2020_to_Present_20241101.csv"
+income_data_path = "s3://initial-notebook-data-bucket-dblab-905418150721/LA_income_2015.csv"
+geojson_path = "s3://initial-notebook-data-bucket-dblab-905418150721/2010_Census_Blocks.geojson"
+re_codes_path = "s3://initial-notebook-data-bucket-dblab-905418150721/RE_codes.csv"
+
+crime_df_2010_2019 = spark.read.csv(crime_data_path_1, header=True, inferSchema=True)
+crime_df_2020_present = spark.read.csv(crime_data_path_2, header=True, inferSchema=True)
+crime_data_df = crime_df_2010_2019.union(crime_df_2020_present)
+
+income_df = spark.read.csv(income_data_path, header=True, inferSchema=True)
+re_codes_df = spark.read.csv(re_codes_path, header=True, inferSchema=True)
+
+# Load GeoJSON data
+geojson_df = sedona.read.format("geojson") \
+            .option("multiLine", "true").load(geojson_path) \
+            .selectExpr("explode(features) as feature")
+
+geojson_df = geojson_df.select(
+    col("feature.geometry").alias("geometry"),
+    col("feature.properties.*")
+)
+
+# Filter only Los Angeles areas
+la_blocks = geojson_df.filter(col("CITY") == "Los Angeles") \
+    .select("COMM", "ZCTA10", "POP_2010", "HOUSING10", "geometry")
+
+# Clean and calculate income
+income_df = income_df.withColumn(
+    "Estimated Median Income",
+    regexp_replace(col("Estimated Median Income"), r"[^0-9.]", "").cast("double")
+)
+
+# Filter crimes for 2015 κand create geometry
+crime_2015 = crime_data_df.filter(
+    (col("LAT").isNotNull()) & (col("LON").isNotNull()) &
+    (year(to_date(col("DATE OCC"), "MM/dd/yyyy hh:mm:ss a")) == 2015)
+).withColumn("geometry", ST_Point(col("LON"), col("LAT")))
+
+# Calculate income per capita
+income_per_person = la_blocks.join(
+    income_df,
+    la_blocks["ZCTA10"] == income_df["Zip Code"],
+    "inner"
+).withColumn(
+    "Total Income",
+    (col("HOUSING10") * col("Estimated Median Income"))
+).groupBy("COMM").agg(
+    ST_Union_Aggr("geometry").alias("geometry"),
+    sum("Total Income").alias("Total_Income"),
+    sum("POP_2010").alias("Total_Population")
+).withColumn(
+    "Avg_Income_Per_Person",
+    (col("Total_Income") / col("Total_Population"))
+)
+
+# Choose top 3 and bottom 3 income areas
+top_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=False).limit(3)
+bottom_3_income_areas = income_per_person.orderBy("Avg_Income_Per_Person", ascending=True).limit(3)
+
+# Function for spatial join and victim profile
+def get_victim_profile(areas):
+    join_result = crime_2015.join(
+        areas,
+        ST_Within(crime_2015["geometry"], areas["geometry"])
+    )
+    
+    profile = join_result.groupBy("Vict Descent").agg(
+        count("*").alias("Victim_Count")
+    ).join(
+        re_codes_df,
+        "Vict Descent",
+        "left"
+    ).withColumn(
+        "Victim Descent Full",
+        when(col("Vict Descent Full").isNull(), col("Vict Descent")).otherwise(col("Vict Descent Full"))
+    ).select(
+        col("Victim Descent Full").alias("Victim Descent"),
+        "Victim_Count"
+    ).orderBy("Victim_Count", ascending=False)
+
+    return profile
+
+# Print victims profile
+print("\n=== Victim Profile in High-Income Areas ===")
+get_victim_profile(top_3_income_areas).show(truncate=False)
+
+print("\n=== Victim Profile in Low-Income Areas ===")
+get_victim_profile(bottom_3_income_areas).show(truncate=False)
+
+# Calculate total execution time
+end_time = time.time()
+print(f"Execution Time: {end_time - start_time} seconds")
